@@ -51,6 +51,9 @@ if __name__ == '__main__':
      args = parser.parse_args()
      arg_groups = get_argparse_groups(parser)
 
+     print(temp_args)
+     print(args)
+     print(arg_groups)
      # Initialize logger, trainer, model, datamodule
      model = ScoreModel(
           backbone=args.backbone, sde=args.sde, data_module_cls=data_module_cls,
@@ -83,7 +86,7 @@ if __name__ == '__main__':
           arg_groups['pl.Trainer'],
           strategy=DDPPlugin(find_unused_parameters=False), logger=logger,
           log_every_n_steps=10, num_sanity_val_steps=0,
-          callbacks=callbacks
+          callbacks=callbacks,
      )
 
      # Train model
