@@ -34,7 +34,6 @@ class dat_trans_merge_crm(nn.Module):
             time_emb_layers.append(nn.Linear(nf * 4, nf * 4))
             time_emb_layers[-1].weight.data = default_initializer()(time_emb_layers[-1].weight.shape)
             nn.init.zeros_(time_emb_layers[-1].bias)
-        
         self.time_emb = nn.Sequential(*time_emb_layers)
         
 
@@ -100,7 +99,8 @@ class dense_encoder(nn.Module):
             self.Dense_0 = nn.Linear(temb_dim, width)
             self.Dense_0.weight.data = default_init()(self.Dense_0.weight.data.shape)
             nn.init.zeros_(self.Dense_0.bias)
-        self.enc_dense1 = DenseBlock(161, 4, self.width) # [b, 64, nframes, 512]
+            self.act = act
+        self.enc_dense1 = DenseBlock(act, 161, 4, self.width, temb_dim=temb_dim) # [b, 64, nframes, 512]
         self.enc_conv1 = nn.Conv2d(in_channels=self.width, out_channels=self.width, kernel_size=(1, 3), stride=(1, 2))  # [b, 64, nframes, 256]
         self.enc_norm1 = nn.LayerNorm(80)
         self.enc_prelu1 = nn.PReLU(self.width)
@@ -109,12 +109,12 @@ class dense_encoder(nn.Module):
         out = self.inp_prelu(self.inp_norm(self.inp_conv(x)))  # [b, 64, T, F]
         if temb is not None:
             out += self.Dense_0(self.act(temb))[:, :, None, None]
-        out = self.enc_dense1(out)   # [b, 64, T, F]
+        out = self.enc_dense1(out, temb)   # [b, 64, T, F]
         x = self.enc_prelu1(self.enc_norm1(self.enc_conv1(out)))  # [b, 64, T, F]
         return x
 
 class dense_encoder_mag(nn.Module):
-    def __init__(self, width =64):
+    def __init__(self, act, width =64, temb_dim=None):
         super(dense_encoder_mag, self).__init__()
         self.in_channels = 1
         self.out_channels = 1
@@ -122,13 +122,20 @@ class dense_encoder_mag(nn.Module):
         self.inp_conv = nn.Conv2d(in_channels=self.in_channels, out_channels=self.width, kernel_size=(1, 1))  # [b, 64, nframes, 512]
         self.inp_norm = nn.LayerNorm(161)
         self.inp_prelu = nn.PReLU(self.width)
-        self.enc_dense1 = DenseBlock(161, 4, self.width) # [b, 64, nframes, 512]
+        if temb_dim is not None:
+            self.Dense_0 = nn.Linear(temb_dim, width)
+            self.Dense_0.weight.data = default_init()(self.Dense_0.weight.data.shape)
+            nn.init.zeros_(self.Dense_0.bias)
+            self.act = act
+        self.enc_dense1 = DenseBlock(act, 161, 4, self.width, temb_dim=temb_dim) # [b, 64, nframes, 512]
         self.enc_conv1 = nn.Conv2d(in_channels=self.width, out_channels=self.width, kernel_size=(1, 3), stride=(1, 2))  # [b, 64, nframes, 256]
         self.enc_norm1 = nn.LayerNorm(80)
         self.enc_prelu1 = nn.PReLU(self.width)
 
-    def forward(self, x):
+    def forward(self, x, temb=None):
         out = self.inp_prelu(self.inp_norm(self.inp_conv(x)))  # [b, 64, T, F]
+        if temb is not None:
+            out += self.Dense_0(self.act(temb))[:, :, None, None]
         out = self.enc_dense1(out)   # [b, 64, T, F]
         x = self.enc_prelu1(self.enc_norm1(self.enc_conv1(out)))  # [b, 64, T, F]
         return x
@@ -159,7 +166,7 @@ class dense_decoder(nn.Module):
 
 
 class DenseBlock(nn.Module): #dilated dense block
-    def __init__(self, input_size, depth=5, in_channels=64, temb_dim=None):
+    def __init__(self, act, input_size, depth=5, in_channels=64, temb_dim=None):
         super(DenseBlock, self).__init__()
         self.depth = depth
         self.in_channels = in_channels
@@ -179,12 +186,19 @@ class DenseBlock(nn.Module): #dilated dense block
                               dilation=(dil, 1)))
             setattr(self, 'norm{}'.format(i + 1), nn.LayerNorm(input_size))
             setattr(self, 'prelu{}'.format(i + 1), nn.PReLU(self.in_channels))
-
-    def forward(self, x):
+            if temb_dim is not None:
+                self.act = act
+                Dense_0 = nn.Linear(temb_dim, self.in_channels)
+                Dense_0.weight.data = default_init()(Dense_0.weight.shape)
+                nn.init.zeros_(Dense_0.bias)
+                setattr(self, 'temb{}'.format(i + 1), Dense_0)
+    def forward(self, x, temb=None):
         skip = x
         for i in range(self.depth):
             out = getattr(self, 'pad{}'.format(i + 1))(skip)
             out = getattr(self, 'conv{}'.format(i + 1))(out)
+            if temb is not None:
+                out = out + getattr(self, 'temb{}'.format(i + 1))(self.act(temb))[:, :, None, None]
             out = getattr(self, 'norm{}'.format(i + 1))(out)
             out = getattr(self, 'prelu{}'.format(i + 1))(out)
             skip = torch.cat([out, skip], dim=1)
