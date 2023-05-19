@@ -1,27 +1,29 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+from torch.nn.modules.activation import MultiheadAttention
+from torch.nn.modules.dropout import Dropout
+from torch.nn.modules.linear import Linear
+from torch.nn.modules.rnn import LSTM, GRU
+from torch.nn.modules.normalization import LayerNorm
+from torch.nn.modules.container import ModuleList
+import copy
 from .ncsnpp_utils import layers, layerspp, normalization
 default_initializer = layers.default_init
 default_init = layers.default_init
+get_act = layers.get_act
 
 class dat_trans_merge_crm(nn.Module):
     def __init__(self,
                  nf = 128,
                  fourier_scale = 16,
                  conditional = True,
+                 nonlinearity = 'swish',
                  ):
         super().__init__()
-        self.en_ri = dense_encoder()
-        self.en_mag = dense_encoder_mag()
-        self.aia_trans_merge = AIA_Transformer_merge(128, 64, num_layers=4)
-        self.aham = AHAM_ori(input_channel=64)
-        self.aham_mag = AHAM_ori(input_channel=64)
+        self.act = act = get_act(nonlinearity)
 
-        self.de1 = dense_decoder()
-        self.de2 = dense_decoder()
-        self.de_mag_mask = dense_decoder_masking()
-
-        
         time_emb_layers = []
         time_emb_layers.append(layerspp.GaussianFourierProjection(embedding_size=nf, scale=fourier_scale))
         embed_dim = 2 * nf
@@ -35,45 +37,52 @@ class dat_trans_merge_crm(nn.Module):
             time_emb_layers[-1].weight.data = default_initializer()(time_emb_layers[-1].weight.shape)
             nn.init.zeros_(time_emb_layers[-1].bias)
         self.time_emb = nn.Sequential(*time_emb_layers)
+
+        self.en_ri = dense_encoder(act=act, width=64, temb_dim=nf*4)
+        self.en_mag = dense_encoder_mag(act=act, width=64, temb_dim=nf*4)
+        self.aia_trans_merge = AIA_Transformer_merge(act=act, input_size=128, output_size=64, num_layers=4, temb_dim=nf*4)
+        self.aham = AHAM_ori(input_channel=64)
+        self.aham_mag = AHAM_ori(input_channel=64)
+
+        self.de1 = dense_decoder(act=act, width=64, temb_dim=nf*4)
+        self.de2 = dense_decoder(act=act, width=64, temb_dim=nf*4)
+        self.de_mag_mask = dense_decoder_masking(act=act, width=64, temb_dim=nf*4)
         
 
 
     def forward(self, x, time_cond):
         batch_size, _, seq_len, _ = x.shape
         x, y = x[:,0], x[:,1]
-        x = torch.cat([x.real, x.imag], dim=1)  # BCTF
-        y = torch.cat([y.real, y.imag], dim=1)  # BCTF
+        x = torch.stack([x.real, x.imag], dim=1)  # BCTF
+        y = torch.stack([y.real, y.imag], dim=1)  # BCTF
         x_r_input, x_i_input = x[:,0,:,:], x[:,1,:,:]
         y_r_input, y_i_input = y[:,0,:,:], y[:,1,:,:]
         x_mag_ori, x_phase_ori = torch.norm(x, dim=1), torch.atan2(x[:, -1, :, :], x[:, 0, :, :])
         y_mag_ori, y_phase_ori = torch.norm(y, dim=1), torch.atan2(y[:, -1, :, :], y[:, 0, :, :])
-        x_mag = x_mag_ori.unsqueeze(dim = 1)
-        y_mag = y_mag_ori.unsqueeze(dim = 1)
-        input_ri = torch.cat([x_r_input, x_i_input, y_r_input, y_i_input], dim=1)
-        input_mag = torch.cat([x_mag, y_mag], dim=1)
+        input_ri = torch.stack([x_r_input, x_i_input, y_r_input, y_i_input], dim=1)
+        input_mag = torch.stack([x_mag_ori, y_mag_ori], dim=1)
 
         used_sigmas = time_cond
-        temb = self.time_emb[0](torch.log(used_sigmas))
+        temb = self.time_emb[0](used_sigmas)
         if self.conditional:
             temb = self.time_emb[1](temb)
             temb = self.time_emb[2](self.act(temb))
 
         
 
-
         # ri/mag components enconde+ aia_transformer_merge
-        x_ri = self.en_ri(x) #BCTF
-        x_mag_en = self.en_mag(x_mag)
-        x_last_mag, x_outputlist_mag, x_last_ri, x_outputlist_ri  = self.aia_trans_merge(x_mag_en, x_ri)  # BCTF, #BCTFG
+        x_ri = self.en_ri(input_ri, temb) #BCTF
+        x_mag_en = self.en_mag(input_mag, temb)
+        x_last_mag, x_outputlist_mag, x_last_ri, x_outputlist_ri  = self.aia_trans_merge(x_mag_en, x_ri, temb)  # BCTF, #BCTFG
 
         x_ri = self.aham(x_outputlist_ri) #BCT
         x_mag_en = self.aham_mag(x_outputlist_mag)  # BCTF
-        x_mag_mask = self.de_mag_mask(x_mag_en)
+        x_mag_mask = self.de_mag_mask(x_mag_en, temb)  # BCTF
         x_mag_mask = x_mag_mask.squeeze(dim=1)
 
         # real and imag decode
-        x_real = self.de1(x_ri)
-        x_imag = self.de2(x_ri)
+        x_real = self.de1(x_ri, temb)
+        x_imag = self.de2(x_ri, temb)
         x_real = x_real.squeeze(dim = 1)
         x_imag = x_imag.squeeze(dim=1)
         # magnitude and ri components interaction
@@ -89,7 +98,7 @@ class dat_trans_merge_crm(nn.Module):
 class dense_encoder(nn.Module):
     def __init__(self, act, width =64, temb_dim=None):
         super(dense_encoder, self).__init__()
-        self.in_channels = 2
+        self.in_channels = 4
         self.out_channels = 1
         self.width = width
         self.inp_conv = nn.Conv2d(in_channels=self.in_channels, out_channels=self.width, kernel_size=(1, 1))  # [b, 64, nframes, 512]
@@ -116,7 +125,7 @@ class dense_encoder(nn.Module):
 class dense_encoder_mag(nn.Module):
     def __init__(self, act, width =64, temb_dim=None):
         super(dense_encoder_mag, self).__init__()
-        self.in_channels = 1
+        self.in_channels = 2
         self.out_channels = 1
         self.width = width
         self.inp_conv = nn.Conv2d(in_channels=self.in_channels, out_channels=self.width, kernel_size=(1, 1))  # [b, 64, nframes, 512]
@@ -142,22 +151,22 @@ class dense_encoder_mag(nn.Module):
 
 
 class dense_decoder(nn.Module):
-    def __init__(self, width =64):
+    def __init__(self, act, width = 64, temb_dim=None):
         super(dense_decoder, self).__init__()
         self.in_channels = 1
         self.out_channels = 1
         self.pad = nn.ConstantPad2d((1, 1, 0, 0), value=0.)
         self.pad1 = nn.ConstantPad2d((1, 0, 0, 0), value=0.)
         self.width =width
-        self.dec_dense1 = DenseBlock(80, 4, self.width)
+        self.dec_dense1 = DenseBlock(act, 80, 4, self.width, temb_dim=temb_dim) # [b, 64, nframes, 256]
         self.dec_conv1 = SPConvTranspose2d(in_channels=self.width, out_channels=self.width, kernel_size=(1, 3), r=2)
         self.dec_norm1 = nn.LayerNorm(161)
         self.dec_prelu1 = nn.PReLU(self.width)
 
         self.out_conv = nn.Conv2d(in_channels=self.width, out_channels=self.out_channels, kernel_size=(1, 1))
 
-    def forward(self, x):
-        out = self.dec_dense1(x)
+    def forward(self, x, temb=None):
+        out = self.dec_dense1(x, temb)   # [b, 64, T, F]
         out = self.dec_prelu1(self.dec_norm1(self.pad1(self.dec_conv1(self.pad(out)))))
 
         out = self.out_conv(out)
@@ -173,10 +182,6 @@ class DenseBlock(nn.Module): #dilated dense block
         self.pad = nn.ConstantPad2d((1, 1, 1, 0), value=0.)
         self.twidth = 2
         self.kernel_size = (self.twidth, 3)
-        if temb_dim is not None:
-            self.Dense_0 = nn.Linear(temb_dim, out_ch)
-            self.Dense_0.weight.data = default_init()(self.Dense_0.weight.shape)
-            nn.init.zeros_(self.Dense_0.bias)
         for i in range(self.depth):
             dil = 2 ** i
             pad_length = self.twidth + (dil - 1) * (self.twidth - 1) - 1
@@ -357,7 +362,7 @@ class AIA_Transformer_merge(nn.Module):
         num_layers: int, number of stacked RNN layers. Default is 1.
     """
 
-    def __init__(self, input_size,output_size, dropout=0, num_layers=1):
+    def __init__(self, act, input_size,output_size, dropout=0, num_layers=1, temb_dim=None):
         super(AIA_Transformer_merge, self).__init__()
 
         self.input_size = input_size
@@ -374,18 +379,25 @@ class AIA_Transformer_merge(nn.Module):
         self.col_trans = nn.ModuleList([])
         self.row_norm = nn.ModuleList([])
         self.col_norm = nn.ModuleList([])
+        self.tembs = nn.ModuleList([])
         for i in range(num_layers):
             self.row_trans.append(TransformerEncoderLayer(d_model=input_size//2, nhead=4, dropout=dropout, bidirectional=True))
             self.col_trans.append(TransformerEncoderLayer(d_model=input_size//2, nhead=4, dropout=dropout, bidirectional=True))
             self.row_norm.append(nn.GroupNorm(1, input_size//2, eps=1e-8))
             self.col_norm.append(nn.GroupNorm(1, input_size//2, eps=1e-8))
+            if temb_dim is not None:
+                self.act = act
+                Dense_0 = nn.Linear(temb_dim, input_size // 2)
+                Dense_0.weight.data = default_init()(Dense_0.weight.shape)
+                nn.init.zeros_(Dense_0.bias)
+                self.tembs.append(Dense_0)
 
         # output layer
         self.output = nn.Sequential(nn.PReLU(),
                                     nn.Conv2d(input_size//2, output_size, 1)
                                     )
 
-    def forward(self, input1, input2):
+    def forward(self, input1, input2, temb):
         #  input --- [B,  C,  T, F]  --- [b, c, dim2, dim1]
         b, c, dim2, dim1 = input1.shape
         output_list_mag = []
@@ -394,9 +406,14 @@ class AIA_Transformer_merge(nn.Module):
         input_mag = self.input(input_merge)
         input_ri = self.input(input_merge)
         for i in range(len(self.row_trans)):
+            if temb is not None:
+                temb_ = self.tembs[i](self.act(temb))[:, :, None, None]
+
             if i >=1:
                 output_mag_i = output_list_mag[-1] + output_list_ri[-1]
             else: output_mag_i = input_mag
+            output_mag_i = output_mag_i + temb_
+
             AFA_input_mag = output_mag_i.permute(3, 0, 2, 1).contiguous().view(dim1, b*dim2, -1)  # [F, B*T, c]
             AFA_output_mag = self.row_trans[i](AFA_input_mag)  # [F, B*T, c]
             AFA_output_mag = AFA_output_mag.view(dim1, b, dim2, -1).permute(1, 3, 2, 0).contiguous()  # [B, C, T, F]
@@ -413,6 +430,7 @@ class AIA_Transformer_merge(nn.Module):
             if i >=1:
                 output_ri_i = output_list_ri[-1] + output_list_mag[-2]
             else: output_ri_i = input_ri
+            output_ri_i = output_ri_i + temb_
             #input_ri_mag = output_ri_i + output_list_mag[-1]
             AFA_input_ri = output_ri_i.permute(3, 0, 2, 1).contiguous().view(dim1, b*dim2, -1)  # [F, B*T, c]
             AFA_output_ri = self.row_trans[i](AFA_input_ri)  # [F, B*T, c]
@@ -433,48 +451,6 @@ class AIA_Transformer_merge(nn.Module):
         return output_mag_i, output_list_mag, output_ri_i, output_list_ri
 
 
-class AHAM(nn.Module):  # aham merge
-    def __init__(self,  input_channel=64, kernel_size=(1,1), bias=True):
-        super(AHAM, self).__init__()
-
-        self.k3 = Parameter(torch.zeros(1))
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        # self.conv_mask = nn.Conv2d(inplanes, 1, kernel_size=1)
-        self.softmax = nn.Softmax(dim=-2)
-        self.conv1=nn.Conv2d(input_channel, 1, kernel_size, (1, 1), bias=bias)
-
-    def merge(self, x, y):
-        batch, channel, height, width, blocks = x.size()
-        input_x = x
-        y = self.softmax(y)
-        context = torch.matmul(input_x, y)
-        context = context.view(batch, channel, height, width)
-
-        return context
-
-    def forward(self, input_list): #X:BCTFG Y:B11G1
-        batch, channel, frames, frequency= input_list[-1].size()
-        x_list = []
-        y_list = []
-        for i in range(len(input_list)):
-            input = self.avg_pool(input_list[i])
-            y = self.conv1(input)
-            x = input_list[i].unsqueeze(-1)
-            y= y.unsqueeze(-2)
-            x_list.append(x)
-            y_list.append(y)
-
-        x_merge = torch.cat((x_list[0],x_list[1], x_list[2], x_list[3]), dim=-1)
-        y_merge = torch.cat((y_list[0],y_list[1], y_list[2], y_list[3]), dim=-2)
-
-        y_softmax = self.softmax(y_merge)
-
-        aham= torch.matmul(x_merge, y_softmax)
-        aham= aham.view(batch, channel, frames, frequency)
-        aham_output = input_list[-1] + aham
-        return aham_output
-
-
 class AHAM_ori(nn.Module):  # aham merge, share the weights on 1D CNN get better performance and lower parameter
     def __init__(self,  input_channel=64, kernel_size=(1,1), bias=True, act=nn.ReLU(True)):
         super(AHAM_ori, self).__init__()
@@ -484,15 +460,6 @@ class AHAM_ori(nn.Module):  # aham merge, share the weights on 1D CNN get better
         # self.conv_mask = nn.Conv2d(inplanes, 1, kernel_size=1)
         self.softmax = nn.Softmax(dim=-2)
         self.conv1=nn.Conv2d(input_channel, 1, kernel_size, (1, 1), bias=bias)
-
-    def merge(self, x, y):
-        batch, channel, height, width, blocks = x.size()
-        input_x = x  # B*C*T*F*G
-        y = self.softmax(y)
-        context = torch.matmul(input_x, y)
-        context = context.view(batch, channel, height, width)  # B*C*T*F
-
-        return context
 
     def forward(self, input_list): #X:BCTFG Y:B11G1
         batch, channel, frames, frequency= input_list[-1].size()
@@ -515,3 +482,46 @@ class AHAM_ori(nn.Module):  # aham merge, share the weights on 1D CNN get better
         aham_output = input_list[-1] + aham
         #print(str(aham_output.shape))
         return aham_output
+
+class dense_decoder_masking(nn.Module):
+    def __init__(self, act, width = 64, temb_dim=None):
+        super(dense_decoder_masking, self).__init__()
+        self.in_channels = 1
+        self.out_channels = 1
+        self.pad = nn.ConstantPad2d((1, 1, 0, 0), value=0.)
+        self.pad1 = nn.ConstantPad2d((1, 0, 0, 0), value=0.)
+        self.width =width
+        self.dec_dense1 = DenseBlock(act, 80, 4, self.width, temb_dim=temb_dim)
+        self.dec_conv1 = SPConvTranspose2d(in_channels=self.width, out_channels=self.width, kernel_size=(1, 3), r=2)
+        self.dec_norm1 = nn.LayerNorm(161)
+        self.dec_prelu1 = nn.PReLU(self.width)
+        self.mask1 = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=1, kernel_size= (1,1)),
+            nn.Sigmoid()
+        )
+        self.mask2 = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=1, kernel_size= (1,1)),
+            nn.Tanh()
+        )
+        self.maskconv = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(1,1))
+        #self.maskrelu = nn.ReLU(inplace=True)
+        self.maskrelu = nn.Sigmoid()
+        self.out_conv = nn.Conv2d(in_channels=self.width, out_channels=self.out_channels, kernel_size=(1, 1))
+
+    def forward(self, x, temb=None):
+        out = self.dec_dense1(x, temb)
+        out = self.dec_prelu1(self.dec_norm1(self.pad1(self.dec_conv1(self.pad(out)))))
+
+        out = self.out_conv(out)
+        out.squeeze(dim=1)
+        out = self.mask1(out) * self.mask2(out)
+        out = self.maskrelu(self.maskconv(out))  # mask
+        return out
+
+def test_diffusion_transformer():
+    model = dat_trans_merge_crm()
+    out = model(torch.complex(torch.randn(8, 2, 200, 161), torch.randn(8, 2, 200, 161)), torch.ones(8)*0.6)
+    import pdb;pdb.set_trace()
+
+if __name__ == "__main__":
+    test_diffusion_transformer()
