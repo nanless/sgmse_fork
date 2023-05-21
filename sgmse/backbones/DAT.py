@@ -8,18 +8,20 @@ from torch.nn.modules.linear import Linear
 from torch.nn.modules.rnn import LSTM, GRU
 from torch.nn.modules.normalization import LayerNorm
 from torch.nn.modules.container import ModuleList
-import copy
 from .ncsnpp_utils import layers, layerspp, normalization
 default_initializer = layers.default_init
 default_init = layers.default_init
 get_act = layers.get_act
+from .shared import BackboneRegistry
 
-class dat_trans_merge_crm(nn.Module):
+@BackboneRegistry.register("DAT")
+class DAT(nn.Module):
     def __init__(self,
                  nf = 128,
                  fourier_scale = 16,
                  conditional = True,
                  nonlinearity = 'swish',
+                 **unused_kwargs
                  ):
         super().__init__()
         self.act = act = get_act(nonlinearity)
@@ -47,10 +49,15 @@ class dat_trans_merge_crm(nn.Module):
         self.de1 = dense_decoder(act=act, width=64, temb_dim=nf*4)
         self.de2 = dense_decoder(act=act, width=64, temb_dim=nf*4)
         self.de_mag_mask = dense_decoder_masking(act=act, width=64, temb_dim=nf*4)
-        
+    
 
+    @staticmethod
+    def add_argparse_args(parser):
+        # TODO: add additional arguments of constructor, if you wish to modify them.
+        return parser
 
     def forward(self, x, time_cond):
+        x = x.permute(0, 1, 3, 2)
         batch_size, _, seq_len, _ = x.shape
         x, y = x[:,0], x[:,1]
         x = torch.stack([x.real, x.imag], dim=1)  # BCTF
@@ -90,8 +97,9 @@ class dat_trans_merge_crm(nn.Module):
         x_mag_out=x_mag_mask * x_mag_ori
         x_r_out,x_i_out = (x_mag_out * torch.cos(x_phase_ori) + x_real), (x_mag_out * torch.sin(x_phase_ori)+ x_imag)
 
-        x_com_out = torch.stack((x_r_out,x_i_out),dim=1)
-
+        x_com_out = torch.stack((x_r_out,x_i_out),dim=-1)
+        x_com_out = x_com_out.permute(0, 2, 1, 3)
+        x_com_out = torch.view_as_complex(x_com_out)[:,None, :, :]
         return x_com_out
 
 
@@ -519,8 +527,8 @@ class dense_decoder_masking(nn.Module):
         return out
 
 def test_diffusion_transformer():
-    model = dat_trans_merge_crm()
-    out = model(torch.complex(torch.randn(8, 2, 200, 161), torch.randn(8, 2, 200, 161)), torch.ones(8)*0.6)
+    model = DAT().cuda()
+    out = model(torch.complex(torch.randn(2, 2, 200, 161), torch.randn(2, 2, 200, 161)).cuda(), torch.ones(2).cuda()*0.6)
     import pdb;pdb.set_trace()
 
 if __name__ == "__main__":
