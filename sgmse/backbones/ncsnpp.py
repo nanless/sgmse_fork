@@ -278,6 +278,7 @@ class NCSNpp(nn.Module):
         else:
             raise ValueError(f'embedding type {self.embedding_type} unknown.')
 
+        import pdb;pdb.set_trace()
         if self.conditional:
             temb = modules[m_idx](temb)
             m_idx += 1

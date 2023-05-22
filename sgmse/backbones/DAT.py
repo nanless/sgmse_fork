@@ -70,7 +70,7 @@ class DAT(nn.Module):
         input_mag = torch.stack([x_mag_ori, y_mag_ori], dim=1)
 
         used_sigmas = time_cond
-        temb = self.time_emb[0](used_sigmas)
+        temb = self.time_emb[0](torch.log(used_sigmas))
         if self.conditional:
             temb = self.time_emb[1](temb)
             temb = self.time_emb[2](self.act(temb))
