@@ -310,7 +310,6 @@ class NCSNpp(nn.Module):
                     h = modules[m_idx](h)
                     m_idx += 1
                 hs.append(h)
-                import pdb;pdb.set_trace()
 
             # Downsampling
             if i_level != self.num_resolutions - 1:
@@ -320,8 +319,6 @@ class NCSNpp(nn.Module):
                 else:
                     h = modules[m_idx](hs[-1], temb)
                     m_idx += 1
-                
-                import pdb;pdb.set_trace()
 
                 if self.progressive_input == 'input_skip':   # Combine h with x
                     input_pyramid = self.pyramid_downsample(input_pyramid)
@@ -337,8 +334,6 @@ class NCSNpp(nn.Module):
                         input_pyramid = input_pyramid + h
                     h = input_pyramid
                 hs.append(h)
-
-                import pdb;pdb.set_trace()
 
         h = hs[-1] # actualy equal to: h = h
         h = modules[m_idx](h, temb)  # ResNet block

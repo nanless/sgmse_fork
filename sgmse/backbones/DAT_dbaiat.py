@@ -14,8 +14,8 @@ default_init = layers.default_init
 get_act = layers.get_act
 from .shared import BackboneRegistry
 
-@BackboneRegistry.register("DAT")
-class DAT(nn.Module):
+@BackboneRegistry.register("DAT_DBAIAT")
+class DAT_DBAIAT(nn.Module):
     def __init__(self,
                  nf = 128,
                  fourier_scale = 16,
