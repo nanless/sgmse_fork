@@ -45,6 +45,7 @@ class DAT_MTFAA(nn.Module):
                  fourier_scale = 16,
                  conditional = True,
                  nonlinearity = 'swish',
+                 scale_by_sigma = True,
                  **unused_kwargs
                  ):
         super(DAT_MTFAA, self).__init__()
@@ -105,6 +106,8 @@ class DAT_MTFAA(nn.Module):
         # MEA is causal, so mag_t_dim = 1.
         self.output_layer = nn.Conv2d(4, 2, kernel_size=(3, 3), padding=(1, 1))
 
+        self.scale_by_sigma = scale_by_sigma
+
             
         
         # self.real_mask = nn.Conv2d(4, 2, kernel_size=(3, 1), padding=(1, 0))
@@ -147,6 +150,11 @@ class DAT_MTFAA(nn.Module):
             out = self.decoder_fu[idx](out, encoder_out[-1-idx], temb)
             out = self.decoder_bn[idx][0](out, temb)
             out = self.decoder_bn[idx][1](out)
+
+        
+        if self.scale_by_sigma:
+            used_sigmas = used_sigmas.reshape((x.shape[0], *([1] * len(x.shape[1:]))))
+            out = out / used_sigmas
 
         out = self.output_layer(out)
         out = torch.permute(out, (0, 2, 3, 1)).contiguous()

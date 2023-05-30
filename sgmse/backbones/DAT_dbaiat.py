@@ -1,3 +1,4 @@
+from json import encoder
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -78,24 +79,24 @@ class DAT_DBAIAT(nn.Module):
         
 
         # ri/mag components enconde+ aia_transformer_merge
-        x_ri = self.en_ri(input_ri, temb) #BCTF
-        x_mag_en = self.en_mag(input_mag, temb)
+        x_ri, en_ri_outs = self.en_ri(input_ri, temb) #BCTF
+        x_mag_en, en_mag_outs = self.en_mag(input_mag, temb)
         x_last_mag, x_outputlist_mag, x_last_ri, x_outputlist_ri  = self.aia_trans_merge(x_mag_en, x_ri, temb)  # BCTF, #BCTFG
 
         x_ri = self.aham(x_outputlist_ri) #BCT
         x_mag_en = self.aham_mag(x_outputlist_mag)  # BCTF
-        x_mag_mask = self.de_mag_mask(x_mag_en, temb)  # BCTF
+        x_mag_mask = self.de_mag_mask(x_mag_en, en_mag_outs, temb)  # BCTF
         x_mag_mask = x_mag_mask.squeeze(dim=1)
 
         # real and imag decode
-        x_real = self.de1(x_ri, temb)
-        x_imag = self.de2(x_ri, temb)
+        x_real = self.de1(x_ri, en_ri_outs, temb)
+        x_imag = self.de2(x_ri, en_ri_outs, temb)
         x_real = x_real.squeeze(dim = 1)
         x_imag = x_imag.squeeze(dim=1)
         # magnitude and ri components interaction
 
         x_mag_out=x_mag_mask * x_mag_ori
-        x_r_out,x_i_out = (x_mag_out * torch.cos(x_phase_ori) + x_real), (x_mag_out * torch.sin(x_phase_ori)+ x_imag)
+        x_r_out,x_i_out = (x_mag_out + x_real), (x_mag_out + x_imag)
 
         x_com_out = torch.stack((x_r_out,x_i_out),dim=-1)
         x_com_out = x_com_out.permute(0, 2, 1, 3)
@@ -107,7 +108,6 @@ class dense_encoder(nn.Module):
     def __init__(self, act, width =64, temb_dim=None):
         super(dense_encoder, self).__init__()
         self.in_channels = 4
-        self.out_channels = 1
         self.width = width
         self.inp_conv = nn.Conv2d(in_channels=self.in_channels, out_channels=self.width, kernel_size=(1, 1))  # [b, 64, nframes, 512]
         self.inp_norm = nn.LayerNorm(161)
@@ -126,15 +126,14 @@ class dense_encoder(nn.Module):
         out = self.inp_prelu(self.inp_norm(self.inp_conv(x)))  # [b, 64, T, F]
         if temb is not None:
             out += self.Dense_0(self.act(temb))[:, :, None, None]
-        out = self.enc_dense1(out, temb)   # [b, 64, T, F]
+        out, encoder_outs = self.enc_dense1(out, temb=temb)   # [b, 64, T, F]
         x = self.enc_prelu1(self.enc_norm1(self.enc_conv1(out)))  # [b, 64, T, F]
-        return x
+        return x, encoder_outs
 
 class dense_encoder_mag(nn.Module):
     def __init__(self, act, width =64, temb_dim=None):
         super(dense_encoder_mag, self).__init__()
         self.in_channels = 2
-        self.out_channels = 1
         self.width = width
         self.inp_conv = nn.Conv2d(in_channels=self.in_channels, out_channels=self.width, kernel_size=(1, 1))  # [b, 64, nframes, 512]
         self.inp_norm = nn.LayerNorm(161)
@@ -153,37 +152,68 @@ class dense_encoder_mag(nn.Module):
         out = self.inp_prelu(self.inp_norm(self.inp_conv(x)))  # [b, 64, T, F]
         if temb is not None:
             out += self.Dense_0(self.act(temb))[:, :, None, None]
-        out = self.enc_dense1(out)   # [b, 64, T, F]
+        out, encoder_outs = self.enc_dense1(out, temb=temb)   # [b, 64, T, F]
         x = self.enc_prelu1(self.enc_norm1(self.enc_conv1(out)))  # [b, 64, T, F]
-        return x
+        return x, encoder_outs
 
 
 class dense_decoder(nn.Module):
     def __init__(self, act, width = 64, temb_dim=None):
         super(dense_decoder, self).__init__()
-        self.in_channels = 1
         self.out_channels = 1
         self.pad = nn.ConstantPad2d((1, 1, 0, 0), value=0.)
         self.pad1 = nn.ConstantPad2d((1, 0, 0, 0), value=0.)
         self.width =width
-        self.dec_dense1 = DenseBlock(act, 80, 4, self.width, temb_dim=temb_dim) # [b, 64, nframes, 256]
+        self.dec_dense1 = DenseBlock(act, 161, 4, self.width, temb_dim=temb_dim, decoder=True) # [b, 64, nframes, 256]
         self.dec_conv1 = SPConvTranspose2d(in_channels=self.width, out_channels=self.width, kernel_size=(1, 3), r=2)
         self.dec_norm1 = nn.LayerNorm(161)
         self.dec_prelu1 = nn.PReLU(self.width)
 
         self.out_conv = nn.Conv2d(in_channels=self.width, out_channels=self.out_channels, kernel_size=(1, 1))
 
-    def forward(self, x, temb=None):
-        out = self.dec_dense1(x, temb)   # [b, 64, T, F]
-        out = self.dec_prelu1(self.dec_norm1(self.pad1(self.dec_conv1(self.pad(out)))))
-
+    def forward(self, x, encoder_outs, temb=None):
+        out = self.dec_prelu1(self.dec_norm1(self.pad1(self.dec_conv1(self.pad(x)))))
+        out = self.dec_dense1(out, encoder_outs=encoder_outs, temb=temb)   # [b, 64, T, F]
         out = self.out_conv(out)
         out.squeeze(dim=1)
         return out
 
+class dense_decoder_masking(nn.Module):
+    def __init__(self, act, width = 64, temb_dim=None):
+        super(dense_decoder_masking, self).__init__()
+        self.in_channels = 1
+        self.out_channels = 1
+        self.pad = nn.ConstantPad2d((1, 1, 0, 0), value=0.)
+        self.pad1 = nn.ConstantPad2d((1, 0, 0, 0), value=0.)
+        self.width =width
+        self.dec_dense1 = DenseBlock(act, 161, 4, self.width, temb_dim=temb_dim, decoder=True)
+        self.dec_conv1 = SPConvTranspose2d(in_channels=self.width, out_channels=self.width, kernel_size=(1, 3), r=2)
+        self.dec_norm1 = nn.LayerNorm(161)
+        self.dec_prelu1 = nn.PReLU(self.width)
+        self.mask1 = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=1, kernel_size= (1,1)),
+            nn.Sigmoid()
+        )
+        self.mask2 = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=1, kernel_size= (1,1)),
+            nn.Tanh()
+        )
+        self.maskconv = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(1,1))
+        #self.maskrelu = nn.ReLU(inplace=True)
+        self.maskrelu = nn.Sigmoid()
+        self.out_conv = nn.Conv2d(in_channels=self.width, out_channels=self.out_channels, kernel_size=(1, 1))
+
+    def forward(self, x, encoder_outs, temb=None):
+        out = self.dec_prelu1(self.dec_norm1(self.pad1(self.dec_conv1(self.pad(x)))))
+        out = self.dec_dense1(out, encoder_outs=encoder_outs, temb=temb)
+        out = self.out_conv(out)
+        out.squeeze(dim=1)
+        out = self.mask1(out) * self.mask2(out)
+        out = self.maskrelu(self.maskconv(out))  # mask
+        return out
 
 class DenseBlock(nn.Module): #dilated dense block
-    def __init__(self, act, input_size, depth=5, in_channels=64, temb_dim=None):
+    def __init__(self, act, input_size, depth=5, in_channels=64, temb_dim=None, decoder=False):
         super(DenseBlock, self).__init__()
         self.depth = depth
         self.in_channels = in_channels
@@ -193,9 +223,13 @@ class DenseBlock(nn.Module): #dilated dense block
         for i in range(self.depth):
             dil = 2 ** i
             pad_length = self.twidth + (dil - 1) * (self.twidth - 1) - 1
+            if decoder:
+                input_channels = self.in_channels * (i + 1) + in_channels
+            else:
+                input_channels = self.in_channels * (i + 1)
             setattr(self, 'pad{}'.format(i + 1), nn.ConstantPad2d((1, 1, pad_length, 0), value=0.))
             setattr(self, 'conv{}'.format(i + 1),
-                    nn.Conv2d(self.in_channels * (i + 1), self.in_channels, kernel_size=self.kernel_size,
+                    nn.Conv2d(input_channels, self.in_channels, kernel_size=self.kernel_size,
                               dilation=(dil, 1)))
             setattr(self, 'norm{}'.format(i + 1), nn.LayerNorm(input_size))
             setattr(self, 'prelu{}'.format(i + 1), nn.PReLU(self.in_channels))
@@ -205,16 +239,27 @@ class DenseBlock(nn.Module): #dilated dense block
                 Dense_0.weight.data = default_init()(Dense_0.weight.shape)
                 nn.init.zeros_(Dense_0.bias)
                 setattr(self, 'temb{}'.format(i + 1), Dense_0)
-    def forward(self, x, temb=None):
+    def forward(self, x, encoder_outs=None, temb=None):
         skip = x
+        if encoder_outs == None:
+            encoder_outputs = []
         for i in range(self.depth):
+            if encoder_outs != None:
+                skip = torch.cat([skip, encoder_outs[-i-1]], dim=1)
             out = getattr(self, 'pad{}'.format(i + 1))(skip)
             out = getattr(self, 'conv{}'.format(i + 1))(out)
             if temb is not None:
                 out = out + getattr(self, 'temb{}'.format(i + 1))(self.act(temb))[:, :, None, None]
             out = getattr(self, 'norm{}'.format(i + 1))(out)
             out = getattr(self, 'prelu{}'.format(i + 1))(out)
-            skip = torch.cat([out, skip], dim=1)
+            if encoder_outs != None:
+                skip = torch.cat([out, skip[:,:-64]], dim=1)
+            else:
+                skip = torch.cat([out, skip], dim=1)
+            if encoder_outs == None:
+                encoder_outputs.append(out)
+        if encoder_outs == None:
+            return out, encoder_outputs
         return out
 
 class SPConvTranspose2d(nn.Module): #sub-pixel convolution
@@ -491,44 +536,11 @@ class AHAM_ori(nn.Module):  # aham merge, share the weights on 1D CNN get better
         #print(str(aham_output.shape))
         return aham_output
 
-class dense_decoder_masking(nn.Module):
-    def __init__(self, act, width = 64, temb_dim=None):
-        super(dense_decoder_masking, self).__init__()
-        self.in_channels = 1
-        self.out_channels = 1
-        self.pad = nn.ConstantPad2d((1, 1, 0, 0), value=0.)
-        self.pad1 = nn.ConstantPad2d((1, 0, 0, 0), value=0.)
-        self.width =width
-        self.dec_dense1 = DenseBlock(act, 80, 4, self.width, temb_dim=temb_dim)
-        self.dec_conv1 = SPConvTranspose2d(in_channels=self.width, out_channels=self.width, kernel_size=(1, 3), r=2)
-        self.dec_norm1 = nn.LayerNorm(161)
-        self.dec_prelu1 = nn.PReLU(self.width)
-        self.mask1 = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=1, kernel_size= (1,1)),
-            nn.Sigmoid()
-        )
-        self.mask2 = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=1, kernel_size= (1,1)),
-            nn.Tanh()
-        )
-        self.maskconv = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=(1,1))
-        #self.maskrelu = nn.ReLU(inplace=True)
-        self.maskrelu = nn.Sigmoid()
-        self.out_conv = nn.Conv2d(in_channels=self.width, out_channels=self.out_channels, kernel_size=(1, 1))
 
-    def forward(self, x, temb=None):
-        out = self.dec_dense1(x, temb)
-        out = self.dec_prelu1(self.dec_norm1(self.pad1(self.dec_conv1(self.pad(out)))))
-
-        out = self.out_conv(out)
-        out.squeeze(dim=1)
-        out = self.mask1(out) * self.mask2(out)
-        out = self.maskrelu(self.maskconv(out))  # mask
-        return out
 
 def test_diffusion_transformer():
-    model = DAT().cuda()
-    out = model(torch.complex(torch.randn(2, 2, 200, 161), torch.randn(2, 2, 200, 161)).cuda(), torch.ones(2).cuda()*0.6)
+    model = DAT_DBAIAT().cuda()
+    out = model(torch.complex(torch.randn(2, 2, 161, 400), torch.randn(2, 2, 161, 400)).cuda(), torch.ones(2).cuda()*0.6)
     import pdb;pdb.set_trace()
 
 if __name__ == "__main__":
