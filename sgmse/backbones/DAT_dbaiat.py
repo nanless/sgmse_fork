@@ -1,4 +1,5 @@
 from json import encoder
+from pyexpat.model import XML_CQUANT_NONE
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,6 +23,8 @@ class DAT_DBAIAT(nn.Module):
                  fourier_scale = 16,
                  conditional = True,
                  nonlinearity = 'swish',
+                 scale_by_sigma = False,
+                 copy_original_phase = False,
                  **unused_kwargs
                  ):
         super().__init__()
@@ -50,11 +53,22 @@ class DAT_DBAIAT(nn.Module):
         self.de1 = dense_decoder(act=act, width=64, temb_dim=nf*4)
         self.de2 = dense_decoder(act=act, width=64, temb_dim=nf*4)
         self.de_mag_mask = dense_decoder_masking(act=act, width=64, temb_dim=nf*4)
-    
+
+        self.scale_by_sigma = scale_by_sigma
+        self.copy_original_phase = copy_original_phase
 
     @staticmethod
     def add_argparse_args(parser):
         # TODO: add additional arguments of constructor, if you wish to modify them.
+        parser.add_argument("--no-centered", dest="centered", action="store_false", help="The data is not centered [-1, 1]")
+        parser.add_argument("--centered", dest="centered", action="store_true", help="The data is centered [-1, 1]")
+        parser.set_defaults(centered=True)
+        parser.add_argument("--no-scale_by_sigma", dest="scale_by_sigma", action="store_false", help="Scale the output by sigma")
+        parser.add_argument("--scale_by_sigma", dest="scale_by_sigma", action="store_true", help="Scale the output by sigma")
+        parser.set_defaults(scale_by_sigma=False)
+        parser.add_argument("--no-copy_original_phase", dest="copy_original_phase", action="store_false", help="Copy the original phase")
+        parser.add_argument("--copy_original_phase", dest="copy_original_phase", action="store_true", help="Copy the original phase")
+        parser.set_defaults(copy_original_phase=False)
         return parser
 
     def forward(self, x, time_cond):
@@ -96,9 +110,13 @@ class DAT_DBAIAT(nn.Module):
         # magnitude and ri components interaction
 
         x_mag_out=x_mag_mask * x_mag_ori
-        x_r_out,x_i_out = (x_mag_out + x_real), (x_mag_out + x_imag)
+        if self.copy_original_phase:
+            x_r_out, x_i_out = x_mag_out * torch.cos(x_phase_ori) + x_real, x_mag_out * torch.sin(x_phase_ori) + x_imag
+        else:
+            x_r_out,x_i_out = (x_mag_out + x_real), (x_mag_out + x_imag)
 
         x_com_out = torch.stack((x_r_out,x_i_out),dim=-1)
+
         x_com_out = x_com_out.permute(0, 2, 1, 3)
         x_com_out = torch.view_as_complex(x_com_out)[:,None, :, :]
         return x_com_out
