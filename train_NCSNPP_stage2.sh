@@ -1,0 +1,1 @@
+TORCH_DISTRIBUTED_DEBUG="DETAIL" CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python train.py --base_dir /data2/zhounan/data/noisy/voicebank_demand/sgmse_data/stage2_data --accelerator gpu --devices 8
